@@ -1,5 +1,6 @@
 ;; Project Codename: Lost Monkey
-(defparameter version "2016-09-21")
+(defparameter version "2016-09-22")
+
 
 (ql:quickload "hunchentoot")
 (ql:quickload "drakma")
@@ -79,15 +80,12 @@
 	 (incf rank)
 	 (format t "Rank: ~a Name: ~a URL: ~a Status: ~a~%Tasks: ~a Cycles: ~:d Performance: ~a cycles/second~%" rank (name n) (url n) (status n) (tasks-performed n) (cycles-performed n) (performance n)))))
 
+(defparameter nodes nil)
+
 ;hosts
 (handler-case
     (load "~/nodes.lisp")
   (error () nil))
-
-(defparameter nodes nil)
-(push loc nodes)
-(push rm1 nodes)
-(push rm2 nodes)
 
 (defparameter history nil)
 
@@ -126,12 +124,18 @@
 ;get an available node (hangs until there is one)
 (defvar node-mutex (sb-thread:make-mutex :name "node-mutex"))
 
+(define-condition all-nodes-offline (error) ())
+
 (defun get-node (nodes-list)
   (let ((retval nil))
     (loop while (null retval) do
 	 (sb-thread:with-mutex (node-mutex)
-	   (loop until (remove-if-not #'(lambda (x) (eq :available (slot-value x 'status))) nodes-list) do (sb-thread:thread-yield))
-	   (setf retval (first (remove-if-not #'(lambda (x) (eq :available (slot-value x 'status))) nodes-list)))))
+	   (loop until (remove-if-not #'(lambda (x) (eq :available (slot-value x 'status))) nodes-list) do
+		(sb-thread:thread-yield)
+		(when (null (remove-if #'(lambda (x) (eq :offline (slot-value x 'status))) nodes-list))
+		  (error 'all-nodes-offline)))
+	   (setf retval (first (remove-if-not #'(lambda (x) (eq :available (slot-value x 'status))) nodes-list)))
+	   (setf (status retval) :working)))
     retval))
 
 (defun calculate-performance (cycles milliseconds)
@@ -146,36 +150,42 @@
 	`(funcall #',(read-from-string ,fn)
 		  ,item)))
 
-(defmacro m-mapcar (fn lst)
+(defmacro m-mapcar (fn lst &optional print-progress)
   (let ((mylambda (prin1-to-string fn)))
     `(mapcar #'(lambda (x) (let ((retval (sb-thread:join-thread x)))
 			     (setf thread-pool (remove x thread-pool))
 			     retval))
-	     (loop for command-to-run in (m-mapcar-helper (multiple-value-bind (flambda fclosure fname)
-							      (function-lambda-expression ,fn)
-							    (declare (ignore flambda))
-							    (if fclosure (subseq ,mylambda 2) (prin1-to-string fname))) ,lst) collect
-		  (let ((command-to-run command-to-run)) ;to prevent reusing closure - thanks to stassats and flip214
-		    (let ((node (get-node nodes))) ;get an available node
-		      (let ((th (sb-thread:make-thread
-				 (lambda (standard-output)
-				   (let ((*standard-output* standard-output))
-				     (let ((result (run-command node command-to-run))) ;run the command on the node
-				       (incf (tasks-performed node))
-				       (incf (cycles-performed node) (second result))
-				       (let ((perf (calculate-performance (second result) (third result)))) ;only overwrite performance when it's >0
-					 (when (> perf 0) (setf (performance node) perf))) ;else it has the last value
-				       (first result))))
-				 :arguments (list *standard-output*))))
-			(push th thread-pool)
-			th)))))))
+	     (let ((task-counter 0))
+	       (loop for command-to-run in (m-mapcar-helper (multiple-value-bind (flambda fclosure fname)
+								(function-lambda-expression ,fn)
+							      (declare (ignore flambda))
+							      (if fclosure (subseq ,mylambda 2) (prin1-to-string fname))) ,lst) collect
+		    (let ((command-to-run command-to-run)) ;to prevent reusing closure - thanks to stassats and flip214
+		      (let ((node (get-node nodes))) ;get an available node
+			(incf task-counter)
+			(when ,print-progress
+			  (format t "~a: ~a: ~a~%" task-counter (name node) (prin1-to-string command-to-run)))
+			(let ((th (sb-thread:make-thread
+				   (lambda (standard-output)
+				     (let ((*standard-output* standard-output))
+				       (let ((result (run-command node command-to-run))) ;run the command on the node
+					 (incf (tasks-performed node))
+					 (let ((cycles-for-result (second result))
+					       (time-for-result (third result)))
+					   (push (list (name node) command-to-run cycles-for-result time-for-result) history)
+					   (incf (cycles-performed node) cycles-for-result)
+					   (let ((perf (calculate-performance cycles-for-result time-for-result))) ;only overwrite performance when it's >0
+					     (when (> perf 0) (setf (performance node) perf))) ;else it has the last value
+					   (first result)))))
+				   :arguments (list *standard-output*))))
+			  (push th thread-pool)
+			  th))))))))
 
 (defmethod run-command ((node computing-node) cmd)
 ;;  (format *standard-output* "Processing at ~a: ~a~%" (name node) (prin1-to-string cmd))
   (handler-case
       (progn
-	(setf (status node) :working)
-	(push (list (name node) cmd) history)
+	;; (push (list (name node) cmd) history)
 	(let ((retval (remote-command (slot-value node 'url) (prin1-to-string cmd))))
 	  (when (eq (status node) :working) ; if the node was disabled during calculation, then don't give it back to the pool
 	    (setf (status node) :available))
@@ -251,22 +261,64 @@
     `(let ((,start-time (get-internal-real-time))
 	   (,result (progn ,@forms))
 	   (,end-time (get-internal-real-time)))
-       (format *debug-io* ";;; Computation took: ~fms (real time)~%" (/ (- ,end-time ,start-time) 1000))
-       ,result)))
+       (let ((elapsed-time (- ,end-time ,start-time)))
+	 ;; (format *debug-io* ";;; Computation took: ~fs (real time)~%" elapsed-time)
+	 (values ,result elapsed-time)))))
 
+;; Explanation for the various values:
+;; Node: the name of the node.
+;; Count-of-tasks: the count of the tasks the node had performed during the calculation.
+;; Node-speed: The node performance (reported by the node), printed as processor cycles/second.
+;; Sum-of-cycles: The sum of processor cycles the node had spent on all of the tasks.
+;; Sum-of-time: The elapsed time the node had spent on all of the tasks.
+;; Network sum-of-cycles: The sum of processor cycles all nodes had spent on all of the tasks.
+;; Network sum-of-time: The sum of time all nodes had spent on all of the tasks (as reported by individual nodes).
+;; Average-node-speed: The network-sum-of-cycles divided by network-sum-of-time. This is the average node speed (if all nodes are 100% available during the whole calculation).
+;; Elapsed-time: The time elapsed during the calculation (as  measured by the master).
+;; Speed: The network-sum-of-cycles divided by elapsed-time. This is the calculated speed of the network.
+;; Estimated-peak: The sum of speeds of nodes that participated in the calculation with at least one task. (The number of participated nodes multiplied by average speed.)
+;; Efficiency: The network-speed (actual) divided by estimated-peak.
+
+;; The longer an average individual task takes to perform on the nodes, the bigger the efficiency is. This is because the network overhead loss is smaller.
 (defmacro report-usage (&body forms)
-  `(progn
-     (setf history nil)
-     (let ((retval (m-timing ,@forms)))
-       (loop for n in nodes do
-	    (let ((counter 0))
-	      (loop for h in history when (equal (car h) (name n)) do (incf counter))
-	      (format t "Node ~a performed ~a tasks. Performance: ~a cycles/second~%" (name n) counter (performance n))))
-       retval)))
+  "Run a calculation and then print a report of node and network usage and performance statistics."
+  (let ((forms forms))
+    `(progn
+       (setf history nil)
+       (multiple-value-bind (retval elapsed-time)
+	   (m-timing ,@forms)
+	 (let ((nodes-participated 0)
+	       (cycles-overall 0)
+	       (time-overall 0))
+	   (format t "========== Node statistics:~%")
+	   (loop for n in nodes do
+		(let ((counter 0)
+		      (cycles-for-node 0)
+		      (time-for-node 0))
+		  (loop for h in history when (equal (car h) (name n)) do
+		       (incf counter)
+		       (incf cycles-for-node (third h))
+		       (incf time-for-node (fourth h)))
+		  (when (> counter 0)
+		    (incf nodes-participated)
+		    (format t "Node: ~a   Count-of-tasks: ~a   Node-speed: ~,3f GHz~%" (name n) counter (/ (performance n) 1000000))
+		    (format t "Sum-of-cycles: ~:d   Sum-of-time: ~:dms~%" cycles-for-node time-for-node)
+		    (incf cycles-overall cycles-for-node)
+		    (incf time-overall time-for-node))))
+	   (format t "========== Network statistics:~%Sum-of-cycles: ~:d   Sum-of-time: ~:dms   Average-node-speed: ~,3f GHz~%" cycles-overall time-overall (/ cycles-overall time-overall 1000000))
+	   (format t "Elapsed time: ~:dms   Speed: ~,3f GHz   Estimated-peak: ~,3f GHz   Efficiency: ~,2f%~%"
+		   elapsed-time
+		   (/ cycles-overall elapsed-time 1000000)
+		   (* nodes-participated (/ cycles-overall time-overall 1000000))
+		   (* 100 (/ (/ cycles-overall elapsed-time) (* nodes-participated (/ cycles-overall time-overall))))))
+	 retval))))
 
 ;; try this:
-;; (loop for i from 25 to 35 do
-;;      (format t "(m-mapcar #'fib (loop for j from 1 to 100 collect ~a))~%" i)
-;;      (report-usage (m-mapcar #'fib (loop for j from 1 to 100 collect i))))
+;; (loop for i from 20 to 38 do
+;; 	      (report-usage 
+;; 		(progn
+;; 		  (format t "Calculating 100x fibonacci(~a)~%" i)
+;; 		  (m-mapcar #'naive-fibonacci (loop for j from 1 to 100 collect i)))))
 
-(node-status nodes)
+(node-report nodes)
+(enable-node company-laptop)
